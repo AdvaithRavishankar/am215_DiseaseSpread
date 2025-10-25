@@ -8,7 +8,7 @@ This project implements epidemiological models (SIR/SEIR) to forecast the rise o
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/am215_DiseaseSpread.git
+git clone https://github.com/AdvaithRavishankar/am215_DiseaseSpread.git
 cd am215_DiseaseSpread
 ```
 
@@ -30,7 +30,8 @@ am215_DiseaseSpread/
 │   ├── data_extractor.py         # Data extraction script
 │   ├── baseline.py               # SARIMA baseline model
 │   ├── SIR.py                    # SIR/SEIR epidemiological models
-│   └── main.py                   # Main execution script
+│   |── main.py                   # Main execution script
+|   |__ eval.ipynb                # Plotting code for analysis 
 ├── data/                         # Output folder for processed data
 ├── predictions/                  # Output folder for model predictions
 ├── requirements.txt              # Python dependencies
