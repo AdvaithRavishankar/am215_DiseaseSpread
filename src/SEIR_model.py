@@ -495,7 +495,7 @@ def main():
 
     # Test set forecasting
     print("\n" + "=" * 60)
-    print("Test Set Forecasting (2024)")
+    print("Test Set Forecasting (2024-2025)")
     print("=" * 60)
 
     all_predictions = []

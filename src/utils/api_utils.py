@@ -21,7 +21,7 @@ def fetch_fluview_data(
     regions : List[str]
         List of region codes (e.g., ['CA', 'MA', 'NY', 'nat'])
     epiweeks : str
-        Epiweek range in format 'YYYYWW-YYYYWW' (e.g., '201001-202452')
+        Epiweek range in format 'YYYYWW-YYYYWW' (e.g., '201001-202552')
     max_retries : int
         Maximum number of retry attempts
 

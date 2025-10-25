@@ -207,14 +207,14 @@ def forecast_test_set(
     forecast_horizon: int = 52
 ) -> pd.DataFrame:
     """
-    Forecast on test set (2024 data)
+    Forecast on test set (2024-2025 data)
 
     Parameters:
     -----------
     train_data : pd.DataFrame
         Training data (up to 2023)
     test_data : pd.DataFrame
-        Test data (2024)
+        Test data (2024-2025)
     region : str
         Region to forecast
     forecast_horizon : int
@@ -225,7 +225,7 @@ def forecast_test_set(
     pd.DataFrame
         Predictions with dates
     """
-    print(f"\nForecasting {region} for test period (2024)...")
+    print(f"\nForecasting {region} for test period (2024-2025)...")
 
     # Filter by region
     train_region = train_data[train_data['region'] == region].copy()
@@ -271,7 +271,7 @@ def main():
 
     # Load processed data
     data_path = os.path.join('../data', 'processed_fluview_data.csv')
-    
+
     print(f"\nLoading data from {data_path}...")
     data = pd.read_csv(data_path)
     data['date'] = pd.to_datetime(data['date'])
@@ -282,7 +282,7 @@ def main():
     train_data['date'] = pd.to_datetime(train_data['date'])
     test_data['date'] = pd.to_datetime(test_data['date'])
 
-    regions = ['CA', 'MA', 'NY', 'nat']
+    regions = ['ca', 'ma', 'ny', 'nat']
 
     # Cross-validation
     print("\n" + "=" * 60)
@@ -317,7 +317,7 @@ def main():
 
     # Test set forecasting
     print("\n" + "=" * 60)
-    print("Test Set Forecasting (2024)")
+    print("Test Set Forecasting (2024-2025)")
     print("=" * 60)
 
     all_predictions = []

@@ -78,7 +78,7 @@ def preprocess_fluview_data(df: pd.DataFrame) -> pd.DataFrame:
 def split_train_test(
     df: pd.DataFrame,
     train_end_year: int = 2023,
-    test_year: int = 2024
+    test_start_year: int = 2024
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Split data into training and testing sets
@@ -89,8 +89,8 @@ def split_train_test(
         Preprocessed flu data
     train_end_year : int
         Last year to include in training (inclusive)
-    test_year : int
-        Year to use for testing
+    test_start_year : int
+        First year to use for testing (inclusive, all years >= this will be test)
 
     Returns:
     --------
@@ -98,7 +98,7 @@ def split_train_test(
         Training and testing DataFrames
     """
     train_df = df[df['season'] <= train_end_year].copy()
-    test_df = df[df['season'] == test_year].copy()
+    test_df = df[df['season'] >= test_start_year].copy()
 
     return train_df, test_df
 

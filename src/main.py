@@ -127,7 +127,7 @@ def compare_results():
 
     # Compare test set results
     if os.path.exists(sarima_pred_path):
-        print("\n\nTest Set (2024) Results Comparison:")
+        print("\n\nTest Set (2024-2025) Results Comparison:")
         print("-" * 80)
 
         sarima_pred = pd.read_csv(sarima_pred_path)
@@ -199,7 +199,7 @@ def main():
     print("\nProject: Disease Spread Modeling with SIR/SEIR")
     print("Regions: CA, MA, NY, National")
     print("Training Period: 2010-2023")
-    print("Test Period: 2024")
+    print("Test Period: 2024-2025")
     print("="*80)
 
    

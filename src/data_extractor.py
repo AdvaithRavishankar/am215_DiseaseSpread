@@ -28,9 +28,9 @@ def main():
     regions = ['CA', 'MA', 'NY', 'nat']
     print(f"\nFetching data for regions: {', '.join(regions)}")
 
-    # Define epiweek range (2010 to 2024)
+    # Define epiweek range (2010 to 2025)
     # Format: YYYYWW
-    epiweeks = '201001-202452'
+    epiweeks = '201001-202552'
     print(f"Epiweek range: {epiweeks}")
 
     # Fetch data
@@ -75,7 +75,7 @@ def main():
     train_data, test_data = split_train_test(
         processed_data,
         train_end_year=2023,
-        test_year=2024
+        test_start_year=2024
     )
 
     train_path = os.path.join('../data', 'train_data.csv')
