@@ -25,6 +25,68 @@ from utils import (
 warnings.filterwarnings('ignore')
 
 
+CV_RESULT_COLUMNS = [
+    'fold', 'region', 'train_size', 'test_size',
+    'rmse', 'mae', 'mape', 'r2',
+    'true_peak_week', 'pred_peak_week', 'peak_week_error'
+]
+
+
+def _get_weekly_case_counts(df: pd.DataFrame, population: int) -> np.ndarray:
+    """Return weekly case counts using num_ili when available."""
+    if df.empty:
+        return np.array([])
+
+    if 'num_ili' in df.columns and df['num_ili'].notna().any():
+        cases = df['num_ili'].fillna(method='ffill').fillna(method='bfill').values
+    elif 'num_patients' in df.columns:
+        cases = (df['ili'].values / 100.0) * df['num_patients'].values
+    else:
+        cases = (df['ili'].values / 100.0) * population
+
+    return np.maximum(cases.astype(float), 1e-3)
+
+
+def _daily_to_weekly_cases(daily_cases: np.ndarray) -> np.ndarray:
+    """Aggregate daily values into weekly sums."""
+    if len(daily_cases) < 7:
+        return np.array([])
+
+    n_complete = len(daily_cases) // 7
+    trimmed = daily_cases[: n_complete * 7]
+    return trimmed.reshape(n_complete, 7).sum(axis=1)
+
+
+def _cases_to_ili_percent(case_counts: np.ndarray, num_patients: np.ndarray, population: int) -> np.ndarray:
+    """Map case counts back to ILI percentages using clinic volumes when available."""
+    ili = np.zeros_like(case_counts, dtype=float)
+    if num_patients is not None and len(num_patients) == len(case_counts):
+        mask = num_patients > 0
+        ili[mask] = (case_counts[mask] / num_patients[mask]) * 100.0
+        ili[~mask] = (case_counts[~mask] / population) * 100.0
+    else:
+        ili = (case_counts / population) * 100.0
+    return ili
+
+
+def _select_training_window(train_df: pd.DataFrame, reference_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Return the final full season prior to the reference period."""
+    if train_df.empty or 'season' not in train_df.columns:
+        return train_df
+
+    if reference_df is None or reference_df.empty or 'season' not in reference_df.columns:
+        target = train_df['season'].max()
+        return train_df[train_df['season'] == target]
+
+    min_ref = reference_df['season'].min()
+    candidates = train_df[train_df['season'] < min_ref]
+    if candidates.empty:
+        target = train_df['season'].max()
+        return train_df[train_df['season'] == target]
+    target = candidates['season'].max()
+    return candidates[candidates['season'] == target]
+
+
 class SEIRModel:
     """
     SEIR (Susceptible-Exposed-Infected-Recovered) Model with Vaccination
@@ -61,6 +123,10 @@ class SEIRModel:
         self.protected = int(self.N * vaccination_rate * self.vaccine_effectiveness)
 
         self.params = None
+        self.scale_factor = 1.0
+        self.last_state: Optional[np.ndarray] = None
+        self.train_weeks = 0
+        self.seed_cases = None
 
     def deriv(
         self,
@@ -106,7 +172,8 @@ class SEIRModel:
         beta: float,
         sigma: float,
         gamma: float,
-        days: int = 365
+        days: int = 365,
+        initial_state: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """
         Simulate SEIR model
@@ -127,19 +194,62 @@ class SEIRModel:
         np.ndarray
             Array of shape (days, 4) containing [S, E, I, R] over time
         """
-        # Initial conditions
-        E0 = self.initial_exposed
-        I0 = self.initial_infected
-        R0 = self.protected
-        S0 = self.N - E0 - I0 - R0
-
-        y0 = [S0, E0, I0, R0]
+        if initial_state is None:
+            E0 = max(0.0, float(self.initial_exposed))
+            I0 = max(1.0, float(self.initial_infected))
+            R0 = min(float(self.protected), float(self.N) - E0 - I0)
+            S0 = max(float(self.N) - E0 - I0 - R0, 0.0)
+            y0 = [S0, E0, I0, R0]
+        else:
+            y0 = np.asarray(initial_state, dtype=float)
         t = np.linspace(0, days, days)
 
         # Solve ODE
         solution = odeint(self.deriv, y0, t, args=(beta, sigma, gamma))
 
         return solution
+
+    def _simulate_daily_incidence(
+        self,
+        beta: float,
+        sigma: float,
+        gamma: float,
+        days: int,
+        initial_state: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return daily new infections (sigma * E) and the state trajectory."""
+        solution = self.simulate(beta, sigma, gamma, days=days, initial_state=initial_state)
+        E = solution[:, 1]
+        daily_incidence = np.maximum(sigma * E, 0.0)
+        return daily_incidence, solution
+
+    def _simulate_weekly_incidence(
+        self,
+        beta: float,
+        sigma: float,
+        gamma: float,
+        weeks: int,
+        initial_state: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        weeks = max(int(weeks), 1)
+        days = weeks * 7
+        daily_incidence, solution = self._simulate_daily_incidence(
+            beta,
+            sigma,
+            gamma,
+            days=days,
+            initial_state=initial_state
+        )
+        weekly = _daily_to_weekly_cases(daily_incidence)
+        return weekly[:weeks], solution
+
+    @staticmethod
+    def _optimal_scale(predicted: np.ndarray, observed: np.ndarray) -> float:
+        denom = float(np.dot(predicted, predicted))
+        if denom <= 1e-10:
+            return 0.0
+        scale = float(np.dot(observed, predicted) / denom)
+        return max(scale, 0.0)
 
     def fit(
         self,
@@ -162,21 +272,34 @@ class SEIRModel:
             Fitted (beta, sigma, gamma) parameters
         """
 
+        if len(observed_cases) == 0:
+            raise ValueError("Observed cases array is empty")
+
+        self.train_weeks = len(observed_cases)
+        if len(observed_cases) >= 2:
+            self.seed_cases = float(np.mean(observed_cases[:2]))
+        else:
+            self.seed_cases = float(observed_cases[0])
+        self.initial_infected = max(1.0, self.seed_cases / 7.0)
+        self.initial_exposed = max(self.initial_infected * 2.0, 1.0)
+
         def loss(params):
             beta, sigma, gamma = params
             if beta <= 0 or sigma <= 0 or gamma <= 0:
                 return 1e10
 
             try:
-                solution = self.simulate(beta, sigma, gamma, days=len(observed_cases))
-                predicted = solution[:, 2]  # Infected compartment
+                predicted, _ = self._simulate_weekly_incidence(
+                    beta,
+                    sigma,
+                    gamma,
+                    weeks=self.train_weeks
+                )
 
-                # Scale predicted to match observed
-                if np.max(predicted) > 0:
-                    scale = np.max(observed_cases) / np.max(predicted)
-                    predicted = predicted * scale
+                scale = self._optimal_scale(predicted, observed_cases)
+                adjusted = predicted * scale
 
-                mse = np.mean((observed_cases - predicted) ** 2)
+                mse = np.mean((observed_cases - adjusted) ** 2)
                 return mse
             except:
                 return 1e10
@@ -191,9 +314,22 @@ class SEIRModel:
             result = minimize(loss, x0, method='L-BFGS-B', bounds=bounds)
 
         self.params = result.x
+
+        predicted, solution = self._simulate_weekly_incidence(
+            *self.params,
+            weeks=self.train_weeks
+        )
+        self.scale_factor = max(self._optimal_scale(predicted, observed_cases), 1e-6)
+        self.last_state = solution[-1]
+
         return tuple(self.params)
 
-    def forecast(self, days_ahead: int) -> np.ndarray:
+    def forecast(
+        self,
+        days_ahead: int,
+        continue_from_last: bool = True,
+        restart_seed_cases: Optional[float] = None
+    ) -> np.ndarray:
         """
         Generate forecast
 
@@ -211,9 +347,30 @@ class SEIRModel:
             raise ValueError("Model must be fitted before forecasting")
 
         beta, sigma, gamma = self.params
-        solution = self.simulate(beta, sigma, gamma, days=days_ahead)
 
-        return solution[:, 2]  # Return infected compartment
+        if continue_from_last and self.last_state is not None:
+            initial_state = self.last_state
+        else:
+            if restart_seed_cases is None:
+                restart_seed_cases = self.seed_cases
+            infected_seed = max(1.0, float(restart_seed_cases or 1.0) / 7.0)
+            exposed_seed = max(infected_seed * 2.0, 1.0)
+            E0 = exposed_seed
+            I0 = infected_seed
+            R0 = min(float(self.protected), float(self.N) - E0 - I0)
+            S0 = max(float(self.N) - E0 - I0 - R0, 0.0)
+            initial_state = np.array([S0, E0, I0, R0], dtype=float)
+
+        daily_incidence, solution = self._simulate_daily_incidence(
+            beta,
+            sigma,
+            gamma,
+            days=days_ahead,
+            initial_state=initial_state
+        )
+        self.last_state = solution[-1]
+
+        return daily_incidence * self.scale_factor
 
 
 def convert_ili_to_cases(ili_percent: float, population: int) -> int:
@@ -284,41 +441,48 @@ def run_seir_cv(
         train_fold = region_data.loc[train_idx]
         test_fold = region_data.loc[test_idx]
 
+        # Focus on final training season
+        train_season_df = _select_training_window(train_fold, test_fold)
+
         # Convert ILI to cases
-        train_cases = train_fold['ili'].values * population / 100.0
-        test_cases = test_fold['ili'].values * population / 100.0
+        train_cases = _get_weekly_case_counts(train_season_df, population)
+        test_cases = _get_weekly_case_counts(test_fold, population)
+
+        if len(train_cases) == 0 or len(test_cases) == 0:
+            print("Failed: insufficient data after season filtering")
+            continue
 
         # Initialize and fit model
         model = SEIRModel(
             population=population,
             vaccination_rate=vaccination_rate,
-            initial_exposed=int(train_cases[0] * 2),
-            initial_infected=int(train_cases[0])
+            initial_exposed=int(max(1.0, train_cases[0] * 2)),
+            initial_infected=int(max(1.0, train_cases[0]))
         )
 
         try:
-            # Convert to daily data (approximate: repeat weekly values 7 times)
-            train_cases_daily = np.repeat(train_cases, 7)
+            model.fit(train_cases, method='differential_evolution')
 
-            model.fit(train_cases_daily, method='differential_evolution')
+            # Forecast fresh season length of test fold
+            n_test_weeks = len(test_cases)
+            n_test_days = min(n_test_weeks * 7, forecast_horizon)
+            forecast_daily = np.maximum(
+                model.forecast(
+                    days_ahead=n_test_days,
+                    continue_from_last=False
+                ),
+                0.0
+            )
 
-            # Forecast
-            n_test_days = min(len(test_cases) * 7, forecast_horizon)
-            forecast_daily = model.forecast(days_ahead=n_test_days)
+            forecast_weekly = _daily_to_weekly_cases(forecast_daily)
 
-            # Convert back to weekly (average every 7 days)
-            forecast_weekly = np.array([
-                forecast_daily[i:i+7].mean()
-                for i in range(0, len(forecast_daily), 7)
-            ])
-
-            # Scale back to ILI percentage
-            forecast_ili = (forecast_weekly / population) * 100.0
+            n_test = min(len(test_cases), len(forecast_weekly))
 
             # Calculate metrics
-            n_test = min(len(test_cases), len(forecast_weekly))
             y_true = test_fold['ili'].values[:n_test]
-            y_pred = forecast_ili[:n_test]
+            test_patients = test_fold['num_patients'].values[:n_test] if 'num_patients' in test_fold.columns else None
+            y_pred_cases = forecast_weekly[:n_test]
+            y_pred = _cases_to_ili_percent(y_pred_cases, test_patients, population)
 
             metrics = calculate_metrics(y_true, y_pred)
 
@@ -346,6 +510,9 @@ def run_seir_cv(
         except Exception as e:
             print(f"Failed: {e}")
             continue
+
+    if not cv_results:
+        return pd.DataFrame(columns=CV_RESULT_COLUMNS)
 
     return pd.DataFrame(cv_results)
 
@@ -391,42 +558,50 @@ def forecast_test_set_seir(
     train_region = train_region.sort_values('date')
     test_region = test_region.sort_values('date')
 
-    # Convert ILI to cases
-    train_cases = train_region['ili'].values * population / 100.0
+    # Restrict to most recent training season and convert to weekly cases
+    train_region = _select_training_window(train_region, test_region)
+    train_cases = _get_weekly_case_counts(train_region, population)
+
+    if len(train_cases) == 0:
+        raise ValueError(f"No training cases available for {region} after filtering")
 
     # Initialize and fit model
     model = SEIRModel(
         population=population,
         vaccination_rate=vaccination_rate,
-        initial_exposed=int(train_cases[-1] * 2),
-        initial_infected=int(train_cases[-1])
+        initial_exposed=int(max(1.0, train_cases[0] * 2)),
+        initial_infected=int(max(1.0, train_cases[0]))
     )
 
-    # Convert to daily data
-    train_cases_daily = np.repeat(train_cases, 7)
-
-    model.fit(train_cases_daily, method='differential_evolution')
+    model.fit(train_cases, method='differential_evolution')
 
     # Forecast
     n_test = len(test_region)
-    forecast_daily = model.forecast(days_ahead=n_test * 7)
+    forecast_daily = np.maximum(
+        model.forecast(
+            days_ahead=n_test * 7,
+            continue_from_last=False
+        ),
+        0.0
+    )
 
-    # Convert back to weekly
-    forecast_weekly = np.array([
-        forecast_daily[i:i+7].mean()
-        for i in range(0, len(forecast_daily), 7)
-    ])
-
-    # Scale back to ILI percentage
-    forecast_ili = (forecast_weekly / population) * 100.0
+    forecast_weekly = _daily_to_weekly_cases(forecast_daily)
+    n_pred = min(n_test, len(forecast_weekly))
 
     # Create results DataFrame
-    n_pred = min(len(test_region), len(forecast_ili))
+    if n_pred == 0:
+        raise ValueError("No weekly forecasts produced for test set")
+
+    test_patients = test_region['num_patients'].values[:n_pred] if 'num_patients' in test_region.columns else None
+    forecast_cases = forecast_weekly[:n_pred]
+    forecast_ili = _cases_to_ili_percent(forecast_cases, test_patients, population)
+
     results = pd.DataFrame({
         'date': test_region['date'].values[:n_pred],
         'region': region,
         'true_ili': test_region['ili'].values[:n_pred],
         'predicted_ili': forecast_ili[:n_pred],
+        'predicted_cases': forecast_cases,
         'week': test_region['week'].values[:n_pred],
         'year': test_region['year'].values[:n_pred]
     })
