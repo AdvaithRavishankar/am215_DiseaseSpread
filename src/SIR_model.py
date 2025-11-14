@@ -597,13 +597,6 @@ def forecast_test_set_sir(
     # Filter by region
     train_region = train_data[train_data['region'] == region].copy()
     test_region = test_data[test_data['region'] == region].copy()
-
-    # Limit predictions through October 2024
-    test_region = test_region[
-        (test_region['year'] < 2024) |
-        ((test_region['year'] == 2024) & (test_region['date'] <= '2024-09-31'))
-    ].copy()
-
     train_region = train_region.sort_values('date')
     test_region = test_region.sort_values('date')
 
@@ -622,40 +615,23 @@ def forecast_test_set_sir(
 
     model.fit(train_cases, method='differential_evolution')
 
-    # Rolling forecast: predict 1 week at a time, using actual data to update state for better sensitivity
+    # Forecast the entire test period at once for better epidemic curve continuity
     n_test = len(test_region)
-    all_predictions = []
+    n_test_days = n_test * 7
 
-    for start_idx in range(0, n_test, forecast_horizon):
-        end_idx = min(start_idx + forecast_horizon, n_test)
-        n_weeks_ahead = end_idx - start_idx
+    # Use moderate restart to begin the forecast period
+    forecast_daily = np.maximum(
+        model.forecast(
+            days_ahead=n_test_days,
+            continue_from_last=False,
+            use_moderate_restart=True
+        ),
+        0.0
+    )
 
-        # Get actual cases for the current window to seed the forecast
-        if start_idx == 0:
-            # First window: restart from initial seed
-            seed_cases = train_cases[-1] if len(train_cases) > 0 else 1.0
-        else:
-            # Use actual data from previous weeks to seed
-            actual_window = test_region.iloc[start_idx-1:start_idx]
-            seed_cases = _get_weekly_case_counts(actual_window, population)
-            seed_cases = seed_cases[0] if len(seed_cases) > 0 else 1.0
-
-        # Forecast n_weeks_ahead
-        forecast_daily = np.maximum(
-            model.forecast(
-                days_ahead=n_weeks_ahead * 7,
-                continue_from_last=False,
-                restart_seed_cases=seed_cases
-            ),
-            0.0
-        )
-
-        # Convert to weekly
-        forecast_weekly_cases = _daily_to_weekly_cases(forecast_daily)
-
-        # Store predictions for this window
-        for i in range(min(n_weeks_ahead, len(forecast_weekly_cases))):
-            all_predictions.append(forecast_weekly_cases[i])
+    # Convert to weekly
+    forecast_weekly_cases = _daily_to_weekly_cases(forecast_daily)
+    all_predictions = forecast_weekly_cases[:n_test]
 
     # Convert predictions to ILI percentages
     n_pred = min(n_test, len(all_predictions))
@@ -710,7 +686,7 @@ def main():
     train_data['date'] = pd.to_datetime(train_data['date'])
     test_data['date'] = pd.to_datetime(test_data['date'])
 
-    regions = ['CA', 'MA', 'NY', 'nat']
+    regions = ['nat']
 
     # Cross-validation
     print("\n" + "=" * 60)
