@@ -69,22 +69,38 @@ def _cases_to_ili_percent(case_counts: np.ndarray, num_patients: np.ndarray, pop
     return ili
 
 
-def _select_training_window(train_df: pd.DataFrame, reference_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Return the final full season prior to the reference period."""
+def _select_training_window(train_df: pd.DataFrame, reference_df: Optional[pd.DataFrame], n_seasons: int = 3) -> pd.DataFrame:
+    """
+    Return the most recent n_seasons training seasons prior to the reference period.
+    Using multiple seasons provides more robust parameter estimation.
+
+    Parameters:
+    -----------
+    train_df : pd.DataFrame
+        Training data
+    reference_df : Optional[pd.DataFrame]
+        Reference data (e.g., test set)
+    n_seasons : int
+        Number of recent seasons to include (default: 3)
+    """
     if train_df.empty or 'season' not in train_df.columns:
         return train_df
 
     if reference_df is None or reference_df.empty or 'season' not in reference_df.columns:
-        target = train_df['season'].max()
-        return train_df[train_df['season'] == target]
+        available_seasons = sorted(train_df['season'].unique(), reverse=True)
+        selected_seasons = available_seasons[:n_seasons]
+        return train_df[train_df['season'].isin(selected_seasons)]
 
     min_ref = reference_df['season'].min()
     candidates = train_df[train_df['season'] < min_ref]
     if candidates.empty:
-        target = train_df['season'].max()
-        return train_df[train_df['season'] == target]
-    target = candidates['season'].max()
-    return candidates[candidates['season'] == target]
+        available_seasons = sorted(train_df['season'].unique(), reverse=True)
+        selected_seasons = available_seasons[:n_seasons]
+        return train_df[train_df['season'].isin(selected_seasons)]
+
+    available_seasons = sorted(candidates['season'].unique(), reverse=True)
+    selected_seasons = available_seasons[:n_seasons]
+    return candidates[candidates['season'].isin(selected_seasons)]
 
 
 class SEIRModel:
@@ -97,7 +113,8 @@ class SEIRModel:
         population: int,
         vaccination_rate: float = 0.0,
         initial_exposed: int = 10,
-        initial_infected: int = 1
+        initial_infected: int = 1,
+        use_seasonal_forcing: bool = True
     ):
         """
         Initialize SEIR model
@@ -112,11 +129,14 @@ class SEIRModel:
             Initial number of exposed individuals
         initial_infected : int
             Initial number of infected individuals
+        use_seasonal_forcing : bool
+            Whether to use seasonal forcing for transmission rate
         """
         self.N = population
         self.vaccination_rate = vaccination_rate
         self.initial_exposed = initial_exposed
         self.initial_infected = initial_infected
+        self.use_seasonal_forcing = use_seasonal_forcing
 
         # Adjust for vaccination
         self.vaccine_effectiveness = 0.55
@@ -127,6 +147,8 @@ class SEIRModel:
         self.last_state: Optional[np.ndarray] = None
         self.train_weeks = 0
         self.seed_cases = None
+        self.seasonal_amplitude = 0.0
+        self.seasonal_phase = 0.0
 
     def deriv(
         self,
@@ -137,16 +159,16 @@ class SEIRModel:
         gamma: float
     ) -> list:
         """
-        SEIR differential equations
+        SEIR differential equations with optional seasonal forcing
 
         Parameters:
         -----------
         y : np.ndarray
             Current state [S, E, I, R]
         t : float
-            Time
+            Time (in days)
         beta : float
-            Transmission rate
+            Base transmission rate
         sigma : float
             Incubation rate (1/latent period)
         gamma : float
@@ -160,8 +182,15 @@ class SEIRModel:
         S, E, I, R = y
         N = S + E + I + R
 
-        dSdt = -beta * S * I / N
-        dEdt = beta * S * I / N - sigma * E
+        # Apply seasonal forcing to transmission rate
+        if self.use_seasonal_forcing:
+            seasonal_factor = 1.0 + self.seasonal_amplitude * np.cos(2 * np.pi * t / 365.0 + self.seasonal_phase)
+            beta_t = beta * seasonal_factor
+        else:
+            beta_t = beta
+
+        dSdt = -beta_t * S * I / N
+        dEdt = beta_t * S * I / N - sigma * E
         dIdt = sigma * E - gamma * I
         dRdt = gamma * I
 
@@ -262,7 +291,7 @@ class SEIRModel:
         Parameters:
         -----------
         observed_cases : np.ndarray
-            Observed number of infected individuals
+            Observed number of infected individuals (weekly cases)
         method : str
             Optimization method
 
@@ -284,9 +313,16 @@ class SEIRModel:
         self.initial_exposed = max(self.initial_infected * 2.0, 1.0)
 
         def loss(params):
-            beta, sigma, gamma = params
-            if beta <= 0 or sigma <= 0 or gamma <= 0:
-                return 1e10
+            if self.use_seasonal_forcing:
+                beta, sigma, gamma, seasonal_amp, seasonal_phase = params
+                if beta <= 0 or sigma <= 0 or gamma <= 0 or seasonal_amp < 0 or seasonal_amp > 0.5:
+                    return 1e10
+                self.seasonal_amplitude = seasonal_amp
+                self.seasonal_phase = seasonal_phase
+            else:
+                beta, sigma, gamma = params
+                if beta <= 0 or sigma <= 0 or gamma <= 0:
+                    return 1e10
 
             try:
                 predicted, _ = self._simulate_weekly_incidence(
@@ -300,20 +336,34 @@ class SEIRModel:
                 adjusted = predicted * scale
 
                 mse = np.mean((observed_cases - adjusted) ** 2)
-                return mse
+
+                # Add regularization to prevent overfitting
+                regularization = 0.001 * (beta**2 + sigma**2 + gamma**2)
+                return mse + regularization
             except:
                 return 1e10
 
         # Optimization bounds
-        bounds = [(0.01, 2.0), (0.01, 1.0), (0.01, 1.0)]
+        if self.use_seasonal_forcing:
+            # beta, sigma, gamma, seasonal_amplitude, seasonal_phase
+            bounds = [(0.01, 2.0), (0.01, 1.0), (0.01, 1.0), (0.0, 0.5), (-np.pi, np.pi)]
+            x0 = [0.5, 0.2, 0.1, 0.2, 0.0]
+        else:
+            bounds = [(0.01, 2.0), (0.01, 1.0), (0.01, 1.0)]
+            x0 = [0.5, 0.2, 0.1]
 
         if method == 'differential_evolution':
-            result = differential_evolution(loss, bounds, seed=42, maxiter=100)
+            result = differential_evolution(loss, bounds, seed=42, maxiter=150, workers=1)
         else:
-            x0 = [0.5, 0.2, 0.1]
             result = minimize(loss, x0, method='L-BFGS-B', bounds=bounds)
 
-        self.params = result.x
+        if self.use_seasonal_forcing:
+            beta, sigma, gamma, seasonal_amp, seasonal_phase = result.x
+            self.seasonal_amplitude = seasonal_amp
+            self.seasonal_phase = seasonal_phase
+            self.params = (beta, sigma, gamma)
+        else:
+            self.params = result.x
 
         predicted, solution = self._simulate_weekly_incidence(
             *self.params,
@@ -328,7 +378,8 @@ class SEIRModel:
         self,
         days_ahead: int,
         continue_from_last: bool = True,
-        restart_seed_cases: Optional[float] = None
+        restart_seed_cases: Optional[float] = None,
+        use_moderate_restart: bool = True
     ) -> np.ndarray:
         """
         Generate forecast
@@ -337,11 +388,17 @@ class SEIRModel:
         -----------
         days_ahead : int
             Number of days to forecast
+        continue_from_last : bool
+            If True, continue from last fitted state (better for in-season forecasts)
+        restart_seed_cases : Optional[float]
+            Override seed cases for new season
+        use_moderate_restart : bool
+            If True, use a moderate restart that maintains some infected/exposed population
 
         Returns:
         --------
         np.ndarray
-            Forecasted infected cases
+            Forecasted infected cases (daily)
         """
         if self.params is None:
             raise ValueError("Model must be fitted before forecasting")
@@ -349,8 +406,25 @@ class SEIRModel:
         beta, sigma, gamma = self.params
 
         if continue_from_last and self.last_state is not None:
+            # Continue from the last state (in-season forecasting)
             initial_state = self.last_state
+        elif use_moderate_restart:
+            # Use a moderate restart: keep some proportion of infected/exposed from training end
+            if self.last_state is not None:
+                S_end, E_end, I_end, R_end = self.last_state
+                # Use 30% of ending exposed and infected as starting populations
+                E0 = max(1.0, E_end * 0.3)
+                I0 = max(1.0, I_end * 0.3)
+            else:
+                I0 = max(1.0, self.seed_cases / 7.0 if self.seed_cases else self.initial_infected)
+                E0 = max(I0 * 2.0, 1.0)
+
+            # Refresh susceptible pool for new season, maintain recovered
+            R0 = min(float(self.protected), float(self.N) - E0 - I0)
+            S0 = max(float(self.N) - E0 - I0 - R0, float(self.N) * 0.5)  # at least 50% susceptible
+            initial_state = np.array([S0, E0, I0, R0], dtype=float)
         else:
+            # Full restart from seed
             if restart_seed_cases is None:
                 restart_seed_cases = self.seed_cases
             infected_seed = max(1.0, float(restart_seed_cases or 1.0) / 7.0)
@@ -463,13 +537,14 @@ def run_seir_cv(
         try:
             model.fit(train_cases, method='differential_evolution')
 
-            # Forecast fresh season length of test fold
+            # Forecast using moderate restart for better continuity
             n_test_weeks = len(test_cases)
             n_test_days = min(n_test_weeks * 7, forecast_horizon)
             forecast_daily = np.maximum(
                 model.forecast(
                     days_ahead=n_test_days,
-                    continue_from_last=False
+                    continue_from_last=False,
+                    use_moderate_restart=True
                 ),
                 0.0
             )
