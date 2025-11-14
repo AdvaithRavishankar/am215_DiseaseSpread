@@ -203,8 +203,8 @@ def main():
     print("="*80)
 
    
-    # run_data_extraction()
-    # run_baseline_model()
+    run_data_extraction()
+    run_baseline_model()
     run_sir_model()
     run_seir_model()
     compare_results()
