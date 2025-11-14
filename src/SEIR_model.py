@@ -184,7 +184,7 @@ class SEIRModel:
 
         # Apply seasonal forcing to transmission rate
         if self.use_seasonal_forcing:
-            seasonal_factor = 1.0 + self.seasonal_amplitude * np.cos(2 * np.pi * t / 365.0 + self.seasonal_phase)
+            seasonal_factor = 1.0 + self.seasonal_amplitude * np.cos(2 * np.pi * t / 52.0 + self.seasonal_phase)
             beta_t = beta * seasonal_factor
         else:
             beta_t = beta

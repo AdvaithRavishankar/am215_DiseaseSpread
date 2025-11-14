@@ -175,7 +175,7 @@ class SIRModel:
         # Flu season peaks in winter (around day 0 of year = Jan 1)
         # Use cosine forcing: beta(t) = beta * (1 + amplitude * cos(2*pi*t/365 + phase))
         if self.use_seasonal_forcing:
-            seasonal_factor = 1.0 + self.seasonal_amplitude * np.cos(2 * np.pi * t / 365.0 + self.seasonal_phase)
+            seasonal_factor = 1.0 + self.seasonal_amplitude * np.cos(2 * np.pi * t / 52.0 + self.seasonal_phase)
             beta_t = beta * seasonal_factor
         else:
             beta_t = beta
