@@ -327,7 +327,7 @@ def main():
             train_data,
             test_data,
             region=region,
-            forecast_horizon=52
+            forecast_horizon=104
         )
         all_predictions.append(predictions)
 
