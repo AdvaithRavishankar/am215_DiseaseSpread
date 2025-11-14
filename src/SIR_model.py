@@ -585,7 +585,7 @@ def forecast_test_set_sir(
     pd.DataFrame
         Predictions with dates
     """
-    print(f"\nForecasting {region} for test period (SIR) with rolling {forecast_horizon}-week predictions (more sensitive)...")
+    print(f"\nForecasting {region} for test period (SIR) with rolling {forecast_horizon}-week predictions...")
 
     # Get population and vaccination data
     populations = get_population_data()
@@ -605,6 +605,7 @@ def forecast_test_set_sir(
 
     # Convert ILI metrics to estimated weekly cases
     train_cases = _get_weekly_case_counts(train_region, population)
+    test_cases = _get_weekly_case_counts(test_region, population)
 
     # Initialize and fit model
     model = SIRModel(
@@ -615,47 +616,61 @@ def forecast_test_set_sir(
 
     model.fit(train_cases, method='differential_evolution')
 
-    # Forecast the entire test period at once for better epidemic curve continuity
+    # Rolling window forecasting: predict 1 week, then update with actual data
     n_test = len(test_region)
-    n_test_days = n_test * 7
+    all_predictions = []
 
-    # Use moderate restart to begin the forecast period
-    forecast_daily = np.maximum(
-        model.forecast(
-            days_ahead=n_test_days,
-            continue_from_last=False,
-            use_moderate_restart=True
-        ),
-        0.0
-    )
+    for i in range(n_test):
+        # Predict 1 week ahead
+        forecast_daily = np.maximum(
+            model.forecast(
+                days_ahead=7,
+                continue_from_last=True,
+                use_moderate_restart=False
+            ),
+            0.0
+        )
 
-    # Convert to weekly
-    forecast_weekly_cases = _daily_to_weekly_cases(forecast_daily)
-    all_predictions = forecast_weekly_cases[:n_test]
+        # Sum the 7 days to get weekly prediction
+        weekly_prediction = np.sum(forecast_daily)
+        all_predictions.append(weekly_prediction)
+
+        # Update the model state using the actual observed data for this week
+        # This keeps the model anchored to reality
+        if i < len(test_cases):
+            actual_cases = test_cases[i]
+            # Simulate one week with the actual case count to update internal state
+            # We do this by temporarily adjusting and running the model
+            beta, gamma = model.params
+
+            # Get current state and update infected based on actual data
+            if model.last_state is not None:
+                S, I, R = model.last_state
+                # Update I based on actual weekly cases (roughly)
+                I_actual = max(1.0, actual_cases / 7.0)
+                # Adjust S and R to maintain population balance
+                R = min(R + (I - I_actual), population - I_actual)
+                S = max(population - I_actual - R, population * 0.1)
+                model.last_state = np.array([S, I_actual, R], dtype=float)
 
     # Convert predictions to ILI percentages
-    n_pred = min(n_test, len(all_predictions))
-
-    if n_pred == 0:
-        raise ValueError("No weekly forecasts produced for test set")
-
     if 'num_patients' in test_region.columns:
-        test_patients = test_region['num_patients'].values[:n_pred]
+        test_patients = test_region['num_patients'].values[:n_test]
     else:
-        test_patients = np.full(n_pred, population)
+        test_patients = np.full(n_test, population)
 
-    forecast_cases = np.array(all_predictions[:n_pred])
+    forecast_cases = np.array(all_predictions[:n_test])
     forecast_ili = _cases_to_ili_percent(forecast_cases, test_patients)
 
     # Create results DataFrame
     results = pd.DataFrame({
-        'date': test_region['date'].values[:n_pred],
+        'date': test_region['date'].values[:n_test],
         'region': region,
-        'true_ili': test_region['ili'].values[:n_pred],
-        'predicted_ili': forecast_ili[:n_pred],
+        'true_ili': test_region['ili'].values[:n_test],
+        'predicted_ili': forecast_ili[:n_test],
         'predicted_cases': forecast_cases,
-        'week': test_region['week'].values[:n_pred],
-        'year': test_region['year'].values[:n_pred]
+        'week': test_region['week'].values[:n_test],
+        'year': test_region['year'].values[:n_test]
     })
 
     return results
